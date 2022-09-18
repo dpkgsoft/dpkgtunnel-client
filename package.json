@@ -1,0 +1,36 @@
+{
+  "name": "dpkgtunnel-client",
+  "version": "1.0.0",
+  "description": "A client for DpkgSoft Tunnel",
+  "main": "index.js",
+  "bin": {
+    "dpkgtunnel": "./bin/dpkgtunnel"
+  },
+  "scripts": {
+    "tunnel": "node bin/dpkgtunnel"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dpkgsoft/dpkgtunnel-client.git"
+  },
+  "author": "DpkgSoft Computers, LLC",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/dpkgsoft/dpkgtunnel-client/issues"
+  },
+  "homepage": "https://github.com/dpkgsoft/dpkgtunnel-client#readme",
+  "dependencies": {
+    "axios": "^0.21.1",
+    "chalk": "^3.0.0",
+    "configstore": "^5.0.1",
+    "http-string-parser": "^0.0.6",
+    "node-fetch": "^2.6.0",
+    "parse-raw-http": "^0.0.1",
+    "pino": "^5.17.0",
+    "pino-pretty": "^3.6.1",
+    "prompts": "^2.3.2",
+    "require-module": "^0.1.0",
+    "websocket": "^1.0.31",
+    "ws": "^7.2.3"
+  }
+}

@@ -1,0 +1,349 @@
+#!/usr/bin/env node
+
+const packageJson = require("../package.json");
+const WebSocketClient = require("websocket").client;
+const WebSocket = require("ws");
+const pino = require("pino");
+const fetch = require("node-fetch");
+const prompt = require("prompts");
+const chalk = require("chalk");
+const Configstore = require("configstore");
+const vault = new Configstore(packageJson.name, {});
+const httpParser = require("http-string-parser");
+const fs = require("fs");
+const querystring = require("querystring");
+const axios = require("axios");
+
+const logger = pino({
+    prettyPrint: { colorize: true },
+    level: process.env.LOGLEVEL || 'info',
+    base: {},
+    timestamp: pino.stdTimeFunctions.isoTime
+});
+
+let configJSON = {};
+if (fs.existsSync("./dpkgtunnel-client-config.json")) {
+    configJSON = require("require-module")("./dpkgtunnel-client-config.json");
+}
+const cfg = configJSON || {};
+
+const TUNNEL_APP_ID = 1;
+const API_HOST = cfg.api_host || 'https://api.edwardcode.me/method/';
+
+const MSG_TYPE_BEGIN = 0;
+const MSG_TYPE_END = 1;
+
+const SEQ_BEGIN = 1;
+const SEQ_END = 17;
+
+const PAYLOAD_BEGIN = 17;
+
+const ACCEPT_ENCODING = 'Accept-Encoding';
+const DISABLE_COMPRESS = 'gzip;q=0,deflate;q=0';
+
+const MSG_TYPE_AUTHORIZED = '\3';
+const MSG_TYPE_HTTP = '\1';
+const MSG_TYPE_WS = '\2';
+const MSG_TYPE_DISCONNECT = '\4';
+
+async function auth() {
+    let handled = false;
+    do {
+        const getAuthCode = await fetch(API_HOST + 'auth.getCode?client_id=' + TUNNEL_APP_ID);
+        const getAuthCodeResponse = await getAuthCode.json();
+
+        const { url, deviceId } = getAuthCodeResponse.response;
+
+        if (!getAuthCodeResponse.ok) {
+            return Promise.reject("Failed auth code " + JSON.stringify(getAuthCodeResult));
+        }
+        
+        const promptQuestion = await prompt({
+            type: "confirm",
+            name: "result",
+            initial: true,
+            message: chalk.yellow("Please open this URL to authenticate you using edwardcode.me:", url)
+        });
+
+        if(!promptQuestion.result) {
+            return Promise.reject("Empty auth response " + promptQuestion.result);
+        }
+
+        const codeAuthToken = await fetch(API_HOST + 'auth.getCodeToken?client_id=' + TUNNEL_APP_ID + '&device_id=' + deviceId);
+        const codeAuthTokenResponse = await codeAuthToken.json();
+
+        if (!codeAuthTokenResponse.ok) {
+            logger.error('code_auth_token.status: ', codeAuthToken.status, codeAuthTokenResponse);
+            continue;
+        }
+
+        if (codeAuthTokenResponse.response.access_token) {
+            handled = true;
+        }
+
+        return Promise.resolve(codeAuthTokenResponse.response.access_token);
+    } while(handled === false);
+}
+
+async function api(method, params) {
+    params['access_token'] = cfg.access_token;
+    if (!cfg.access_token) {
+        logger.error("Access token is missing");
+        return false;
+    }
+
+    const queryParams = querystring.stringify(params);
+    try {
+        const query = await fetch(API_HOST + method + '?' + queryParams);
+        const res = await query.json();
+        if (!res.ok) {
+            vault.delete('access_token');
+            logger.error(chalk.error(res));
+            logger.warn(chalk.yellow('Previous settings has been removed.'));
+        }
+        return res.response;
+    } catch(e) {
+        logger.error(e);
+    }
+}
+
+async function getTunnelToken() {
+    if (!cfg.access_token && vault.get('access_token')) {
+        cfg.access_token = vault.get('access_token');
+    }
+
+    if (!cfg.access_token) {
+        logger.info('Try to retrieve access token...');
+        const access_token = await auth();
+        cfg.access_token = access_token;
+        vault.set('access_token', access_token);
+    }
+
+    const response = await api('tunnels.generateToken', {});
+    if (response.token) {
+        cfg.tunnelToken = response.token;
+        cfg.hostSuffix = response.suffix;
+        cfg.hostUrl = response.url;
+        cfg.wsURL = response.websocket;
+
+        logger.debug('tunnel token', cfg.tunnelToken);
+        return cfg.tunnelToken;
+    } else {
+        logger.error('Can\'t retrieve tunnel token');
+        process.exit(1);
+    }
+}
+
+function filterHeaders(payload, proxyHost) {
+    return payload
+        .replace(/Accept-Encoding:.*/, ACCEPT_ENCODING + ': ' + DISABLE_COMPRESS)
+        .replace(/Host: .*/, 'Host: ' + proxyHost);
+}
+
+function getHelpMessage() {
+    return '\n' +
+        'Example dpkgtunnel --host=localhost --port=3000:\n\n' +
+        'Environment variables and options:\n' +
+        chalk.yellow(
+            '--host (PROXY_HOST)\t\t- host of your application (for example: localhost)\n' +
+            '--port (PROXY_PORT)\t\t- port of your application (for example: 3000)\n' +
+            '--http-protocol (PROXY_HTTP_PROTO)\t- http/https (default: http)\n' +
+            '--ws-protocol (PROXY_WS_PROTO)\t\t- ws/wss (default: ws)\n' +
+            '--timeout (PROXY_TIMEOUT)\t\t- timeout for requests to your application (default: 5000)\n'
+        );
+}
+
+function parseOptions() {
+    for (let i = 2; i < process.argv.length; i++) {
+        const [option, value] = process.argv[i].split('=');
+        if (option === '-h') {
+            console.log(getHelpMessage());
+            process.exit(0);
+        }
+
+        switch(option) {
+            case '--port':
+                process.env.PROXY_PORT = value;
+                break;
+            case '--host':
+                process.env.PROXY_HOST = value;
+                break;
+            case '--ws-protocol':
+                process.env.PROXY_WS_PROTO = value;
+                break;
+            case '--http-protocol':
+                process.env.PROXY_HTTP_PROTO = value;
+                break;
+            case '--insecure':
+                process.env.NODE_TLS_REJECT_UNAUTHORIZED = value === '1' ? '0' : '1';
+                break;
+            case '--timeout':
+                process.env.PROXY_TIMEOUT = value;
+                break;
+        }
+    }
+}
+
+async function run() {
+    parseOptions();
+
+    const tunnelToken = await getTunnelToken();
+
+    const WS_URL = cfg.wsURL;
+    // const WS_URL = "ws://localhost:3023";
+    const PROXY_HOST = process.env.PROXY_HOST || 'localhost';
+    const PROXY_HTTP_PROTO = process.env.PROXY_HTTP_PROTO || 'http';
+    const PROXY_WS_PROTO = process.env.PROXY_WS_PROTO || 'ws';
+    const PROXY_PORT = process.env.PROXY_PORT || '3000';
+    const PROXY_TIMEOUT = parseInt(process.env.PROXY_TIMEOUT) || 5000;  
+
+    const url = WS_URL + tunnelToken;
+    logger.debug('initialize', url);
+
+    const map = {};
+    const connections = {};
+    const client = new WebSocketClient();
+    client.connect(url, null, null, {});
+    client.on('connectFailed', (error) => {
+        logger.error('Connect error: ' + error.toString());
+    });
+    let mainSocket = null;
+
+    client.on('connect', (connection) => {
+        mainSocket = connection.socket;
+        logger.debug('connected to', url);
+
+        console.log('\n' + 
+            chalk.blue(
+                '██████╗░██████╗░██╗░░██╗░██████╗░\n' +
+                '██╔══██╗██╔══██╗██║░██╔╝██╔════╝░\n' +
+                '██║░░██║██████╔╝█████═╝░██║░░██╗░\n' +
+                '██║░░██║██╔═══╝░██╔═██╗░██║░░╚██╗\n' +
+                '██████╔╝██║░░░░░██║░╚██╗╚██████╔╝\n' +
+                '╚═════╝░╚═╝░░░░░╚═╝░░╚═╝░╚═════╝░\n' +
+                '\n'
+            )
+        );
+
+        console.log('open: ' + cfg.hostUrl);
+
+        connection.on('close', (code) => {
+            logger.info('disconnected, code:', code);
+        });
+        connection.on('error', (error) => {
+            logger.error('wsMain error', error);
+        });
+        connection.on('message', async (data) => {
+            const query = data.binaryData;
+            // const query = data.binaryData.toString();
+            // const msgType = query.slice(MSG_TYPE_BEGIN, MSG_TYPE_END);
+            const msgType = query.subarray(MSG_TYPE_BEGIN, MSG_TYPE_END).toString();
+            if (msgType === MSG_TYPE_AUTHORIZED) {
+                logger.info("Authorized");
+            } else {
+                const seq = query.subarray(SEQ_BEGIN, SEQ_END);
+                const payload = query.subarray(PAYLOAD_BEGIN).toString();
+                const endpoint = payload.split(' ')[1];
+
+                if (MSG_TYPE_DISCONNECT === msgType || MSG_TYPE_WS === msgType) {
+                    const filteredPayload = filterHeaders(payload, PROXY_HOST);
+
+                    if (MSG_TYPE_DISCONNECT === msgType) {
+                        logger.debug('ws close', seq);
+                        if (connections[seq]) {
+                            connections[seq].close();
+                        }
+                        return;
+                    }
+
+                    connections[seq].send(filteredPayload, {}, () => {
+                        logger.debug('WS REQUEST', 'seq: ' + seq, msgType, endpoint, filteredPayload);
+                    });
+                }
+
+                if (typeof data === "object") {
+                    if (msgType === MSG_TYPE_HTTP) {
+                        payload.split('\r');
+                        if (connections[seq]) {
+                            logger.info(new Date().toString(), 'connection already exists', seq, data.toString());
+                        }
+
+                        let query = payload.toString();
+                        let rawResponse = '';
+                        let parsedRequest = httpParser.parseRequest(query);
+                        parsedRequest.headers['Host'] = PROXY_HOST;
+                        parsedRequest.headers[ACCEPT_ENCODING] = DISABLE_COMPRESS;
+
+                        const upgradeHeader = parsedRequest.headers['Upgrade'] || '';
+                        const isWebsocketUpgrade = upgradeHeader.toLowerCase() === 'websocket';
+                        if (isWebsocketUpgrade) {
+                            return;
+                        }
+
+                        let response = await axios({
+                            url: `${PROXY_HTTP_PROTO}://${PROXY_HOST}:${PROXY_PORT}${parsedRequest.uri}`,
+                            data: parsedRequest.body,
+                            headers: parsedRequest.headers,
+                            method: parsedRequest.method,
+                            responseType: 'arraybuffer',
+                            timeout: PROXY_TIMEOUT,
+                            validateStatus: status => {
+                                return status >= 200 && status < 500;
+                            },
+                        }).catch(e => {
+                                logger.error('502, Error:', e.message);
+                                error = {
+                                    status: 502,
+                                    statusText: "Bad gateway",
+                                    headers: {
+                                        "Content-Type": "text/html"
+                                    },
+                                    data: Buffer.from('Bad gateway', 'utf8')
+                                };
+                        });
+                        
+                        if (!response) {
+                            response = error;
+                        }
+
+                        rawResponse = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
+                        let keys = Object.keys(response.headers);
+                        for(let i = 0; i < keys.length; i++) {
+                            if (keys[i] === "transfer-encoding") {
+                                continue;
+                            }
+                            if (keys[i] === "content-length" && response.headers.hasOwnProperty('transfer-encoding')) {
+                                rawResponse += `content-length: ${response.data.length}\r\n`;
+                                continue;
+                            }
+                            rawResponse += `${keys[i]}:${response.headers[keys[i]]}\r\n`;
+                        }
+                        rawResponse += `\r\n`;
+
+
+                        const buffer = Buffer.concat([
+                            Buffer.alloc(1, 0x01),
+                            seq,
+                            Buffer.from(rawResponse),
+                            response.data
+                        ]);
+
+                        connection.sendBytes(buffer, () => {
+                            logger.debug('REQUEST', 'seq:' + seq, 'type:' + msgType.charCodeAt(0), 'endpoint:' + endpoint, data.toString());
+                            const realIp = parsedRequest['headers']['X-Real-Ip'] || '-';
+                            const statusCode = response.status || '-';
+                            const host = parsedRequest['headers']['Host'] || '-';
+                            const method = parsedRequest['method'] || '-';
+                            const uri = parsedRequest['uri'] || '-';
+                            const ua = parsedRequest['headers']['User-Agent'] || '-';
+                            const length = response.data.length;
+                            logger.info(`${realIp} ${statusCode} ${host} ${method} ${uri} ${ua} ${length}`);
+                        });
+                    }
+                }
+            }
+        });
+    });
+}
+
+run().then().catch((e) => { logger.error(e); });
